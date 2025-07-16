@@ -1,7 +1,6 @@
 import inspect
 import math
 import os
-from typing import Optional
 
 import numpy as np
 import torch
@@ -180,7 +179,7 @@ def get_lr(step: int, *, warmup_steps: int, max_steps: int, max_lr: float, min_l
 
 def train(
     *,
-    dataset_location: str = "fineweb10B",
+    dataset_location: str = "data",
     vocab_size: int = 50304,
     weight_decay: float = 0.1,
     block_size: int = 1024,
