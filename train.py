@@ -1,71 +1,53 @@
+import inspect
+import math
+import os
+from typing import Optional
+
+import numpy as np
+import torch
 import torch.backends
 import torch.nn as nn
-import inspect
-import torch
 import torch.nn.functional as F
-import numpy as np
-import math
-import os 
 
 device = torch.device("cpu")
 if torch.cuda.is_available():
     device = "cuda"
 elif torch.backends.mps.is_available():
-    device = "mps" 
-dataset_location = "fineweb10B"
+    device = "mps"
 print(f"Using device: {device}")
-vocab_size = 50304 
-weight_decay = 0.1
-block_size = 1024
-batch_size = 4 
-epochs = 19073
-total_batch_size = 524288
-lr = 3e-4
-max_steps = epochs
-warmup_steps = 150
-max_lr = lr
-min_lr = max_lr * 0.1
 
-assert total_batch_size % (batch_size * block_size) == 0, "total_batch_size must be divisble by B * T"
-grad_accum_steps = total_batch_size // (batch_size * block_size)
-print(grad_accum_steps)
 
 def load_tokens(filename):
     npt = np.load(filename)
     npt = npt.astype(np.int32)
-    ptt = torch.tensor(npt, dtype=torch.long)
-    return ptt
+    return torch.tensor(npt, dtype=torch.long)
+
 
 class DataLoaderLite:
-    def __init__(self, B, T, split):
+    def __init__(self, B: int, T: int, split: str, data_root: str):
         self.B = B
         self.T = T
-        assert split in {'train', 'val'}
+        assert split in {"train", "val"}
 
-        data_root = dataset_location
-        shards = os.listdir(data_root)
-        shards = [s for s in shards if split in s]
-        shards = sorted(shards)
-        shards = [os.path.join(data_root, s) for s in shards]
-        self.shards = shards
-        assert len(shards) > 0, f"no shards found for split {split}"
+        shards = [s for s in os.listdir(data_root) if split in s]
+        shards = sorted(os.path.join(data_root, s) for s in shards)
+        assert shards, f"no shards found for split {split}"
         print(f"found {len(shards)} shards for split {split}")
+
+        self.shards = shards
         self.reset()
 
     def reset(self):
-        # state, init at shard zero
         self.current_shard = 0
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T
 
     def next_batch(self):
         B, T = self.B, self.T
-        buf = self.tokens[self.current_position : self.current_position+B*T+1]
-        x = (buf[:-1]).view(B, T) # inputs
-        y = (buf[1:]).view(B, T) # targets
-        # advance the position in the tensor
+        buf = self.tokens[self.current_position : self.current_position + B * T + 1]
+        x = (buf[:-1]).view(B, T)
+        y = (buf[1:]).view(B, T)
         self.current_position += B * T
-        # if loading the next batch would be out of bounds, advance to next shard
         if self.current_position + (B * T + 1) > len(self.tokens):
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
@@ -73,7 +55,7 @@ class DataLoaderLite:
         return x, y
 
 class RMSNorm(nn.Module):
-    def __init__(self, input_shape, eps=1e-6):
+    def __init__(self, input_shape: int, eps: float = 1e-6):
         super().__init__()
         self.g = nn.Parameter(torch.ones(input_shape))
         self.b = nn.Parameter(torch.ones(input_shape))
@@ -85,7 +67,6 @@ class RMSNorm(nn.Module):
         output = (output * self.g) + self.b
         return output 
 
-# TODO: Review implementation of CausalSelfAttention
 class CausalSelfAttention(nn.Module):
     def __init__(self, n_embed, n_head):
         self.n_embd = n_embed
@@ -188,88 +169,100 @@ class Model1(nn.Module):
         return output
 
 
-def get_lr(it):
-    # 1) linear warmup for warmup_iters steps
-    if it < warmup_steps:
-        return max_lr * (it+1) / warmup_steps
-    # 2) if it > lr_decay_iters, return min learning rate
-    if it > max_steps:
+def get_lr(step: int, *, warmup_steps: int, max_steps: int, max_lr: float, min_lr: float) -> float:
+    if step < warmup_steps:
+        return max_lr * (step + 1) / warmup_steps
+    if step > max_steps:
         return min_lr
-    # 3) in between, use cosine decay down to min learning rate
-    decay_ratio = (it - warmup_steps) / (max_steps - warmup_steps)
-    assert 0 <= decay_ratio <= 1
-    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio)) # coeff starts at 1 and goes to 0
+    decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+    coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
     return min_lr + coeff * (max_lr - min_lr)
 
-train_dataloader = DataLoaderLite(B=batch_size, T=block_size, split="train")
-val_dataloader = DataLoaderLite(B=batch_size, T=block_size, split="val")
+def train(
+    *,
+    dataset_location: str = "fineweb10B",
+    vocab_size: int = 50304,
+    weight_decay: float = 0.1,
+    block_size: int = 1024,
+    batch_size: int = 4,
+    epochs: int = 19073,
+    total_batch_size: int = 524288,
+    lr: float = 3e-4,
+    warmup_steps: int = 150,
+    embed_dim: int = 768,
+    num_heads: int = 16,
+    num_blocks: int = 8,
+    dropout: float = 0.2,
+):
+    max_steps = epochs
+    max_lr = lr
+    min_lr = max_lr * 0.1
 
-model = Model1(block_size=block_size, vocab_size=vocab_size, embed_dim=768, num_heads=16, num_blocks=8, dropout=0.2).to(device)
-if device == "mps":
-    pass
-else:
-    model = torch.compile(model)
+    assert total_batch_size % (batch_size * block_size) == 0, "total_batch_size must be divisble by B * T"
+    grad_accum_steps = total_batch_size // (batch_size * block_size)
 
-fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
-use_fused = fused_available and device == "cuda"
+    train_dataloader = DataLoaderLite(batch_size, block_size, "train", dataset_location)
+    val_dataloader = DataLoaderLite(batch_size, block_size, "val", dataset_location)
 
-loss = nn.CrossEntropyLoss()
+    model = Model1(block_size, vocab_size, embed_dim, num_heads, num_blocks, dropout).to(device)
+    if device != "mps":
+        model = torch.compile(model)
 
-param_dict = [p for p in model.parameters()]
-param_dict = [p for p in param_dict if p.requires_grad]
-        # create optim groups. Any parameters that is 2D will be weight decayed, otherwise no.
-        # i.e. all weight tensors in matmuls + embeddings decay, all biases and layernorms don't.
-decay_params = [p for p in param_dict if p.dim() >= 2]
-nodecay_params = [p for p in param_dict if p.dim() < 2]
-optim_groups = [
-    {'params': decay_params, 'weight_decay': weight_decay},
-    {'params': nodecay_params, 'weight_decay': 0.0}
-]
+    fused_available = "fused" in inspect.signature(torch.optim.AdamW).parameters
+    use_fused = fused_available and device == "cuda"
 
-optimizer = torch.optim.AdamW(optim_groups, lr=lr, fused=use_fused)
-print("Parameter weight decay set")
+    loss_fn = nn.CrossEntropyLoss()
 
-for epoch in range(epochs):
-    optimizer.zero_grad()
-    loss_acum = 0.0
-    
-    for micro_step in range(grad_accum_steps):
-        x, y = train_dataloader.next_batch()
-        x, y = x.to(device), y.to("cpu")
-        # x, y = x.to(device), y.to(device)
-        output = model(x).to("cpu")
-        # output = model(x)
-        train_loss = loss(output.view(-1, output.size(-1)), y.view(-1))
-        train_loss = train_loss.to(device) 
-        output = output.to(device)
+    param_dict = [p for p in model.parameters() if p.requires_grad]
+    decay_params = [p for p in param_dict if p.dim() >= 2]
+    nodecay_params = [p for p in param_dict if p.dim() < 2]
+    optim_groups = [
+        {"params": decay_params, "weight_decay": weight_decay},
+        {"params": nodecay_params, "weight_decay": 0.0},
+    ]
 
-        train_loss = train_loss / grad_accum_steps
-        loss_acum += train_loss.detach()
-        train_loss.backward()
+    optimizer = torch.optim.AdamW(optim_groups, lr=lr, fused=use_fused)
+    print("Parameter weight decay set")
 
-    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+    for epoch in range(epochs):
+        optimizer.zero_grad()
+        loss_acum = 0.0
 
-    output = output.to(device)
-    
-    # for param in model.parameters():
-        # param.grad = None
+        for _ in range(grad_accum_steps):
+            x, y = train_dataloader.next_batch()
+            x, y = x.to(device), y.to("cpu")
+            output = model(x).to("cpu")
+            train_loss = loss_fn(output.view(-1, output.size(-1)), y.view(-1))
+            train_loss = train_loss.to(device)
+            output = output.to(device)
 
-    optimizer.step()
-    
-    lr = get_lr(epoch)
-    for param_group in optimizer.param_groups:
-        param_group['lr'] = lr
+            train_loss = train_loss / grad_accum_steps
+            loss_acum += train_loss.detach()
+            train_loss.backward()
 
-    with torch.no_grad():
-        x, y = val_dataloader.next_batch()
-        x, y = x.to(device), y.to("cpu")
-        output = model(x)
-        output = output.to("cpu")
-        val_loss = loss(output.view(-1, output.size(-1)), y.view(-1))
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+        optimizer.step()
 
-    print_statement = f"Epoch: {epoch}| Train Loss: {loss_acum.item()} | Val Loss: {val_loss.item()} | Norm: {norm} | lr: {lr}"
+        lr_step = get_lr(epoch, warmup_steps=warmup_steps, max_steps=max_steps, max_lr=max_lr, min_lr=min_lr)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr_step
 
-    with open("log.txt", 'a') as fd:
-        fd.write(f"{print_statement}\n")
+        with torch.no_grad():
+            x, y = val_dataloader.next_batch()
+            x, y = x.to(device), y.to("cpu")
+            output = model(x).to("cpu")
+            val_loss = loss_fn(output.view(-1, output.size(-1)), y.view(-1))
 
-    print(print_statement)
+        print_statement = (
+            f"Epoch: {epoch}| Train Loss: {loss_acum.item()} | Val Loss: {val_loss.item()} | Norm: {norm} | lr: {lr_step}"
+        )
+        with open("log.txt", "a") as fd:
+            fd.write(f"{print_statement}\n")
+        print(print_statement)
+
+    torch.save(model.state_dict(), "model_weights.pth")
+    torch.save(optimizer.state_dict(), "optimizer_weights.pth")
+
+
+if __name__ == "__main__":
+    train()
