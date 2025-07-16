@@ -4,3 +4,6 @@ model_weights
 logs
 .DS_Store
 data
+__pycache__
+.kaggle
+.idea
